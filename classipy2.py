@@ -1,21 +1,34 @@
+# Core GUI libraries and userform information
 import classipy2_ui
 from PyQt4 import QtCore, QtGui, QtOpenGL
 import sys
 
+# Numeric processing tools
 import numpy as np
-from osgeo import gdal
-from PIL import Image, ImageQt
+from math import acos, sin, radians, degrees
+import pandas as pd
 
-from skimage.feature import greycomatrix, greycoprops
+# Geoprocessing tools
+from osgeo import gdal
+import pyproj
+
+# Image processing
+from PIL import Image, ImageQt
+from skimage.feature import greycomatrix, greycoprops, canny
 from skimage import data
 
+# Machine learning 
 from sklearn.model_selection import train_test_split
 from sklearn.ensemble import RandomForestClassifier
 from sklearn import metrics
+from sklearn.tree import export_graphviz
+from sklearn.preprocessing import normalize
 
-import pandas as pd
-
+# Database
 import mysql.connector
+
+# Other
+import pydot
 
 #######Tools to be implemented#######
 
@@ -71,6 +84,7 @@ class classiPy2_Form(QtGui.QMainWindow, classipy2_ui.Ui_MainWindow):
         self.connect(self.toolExport, QtCore.SIGNAL("clicked()"), self.exportRaster)
         
         self.actionDeleteSelected.triggered.connect(self.deleteSelected)
+        self.connect(self.toolDeleteRaster, QtCore.SIGNAL("clicked()"), self.deleteSelected)
         self.contrastSlider.sliderReleased.connect(self.changeContrast)
         
         self.connect(self.actionCommitGraphics, QtCore.SIGNAL("clicked()"), self.drawArea.commitPatches)
@@ -86,6 +100,8 @@ class classiPy2_Form(QtGui.QMainWindow, classipy2_ui.Ui_MainWindow):
         self.connect(self.actionCreateNewDb, QtCore.SIGNAL("clicked()"), self.createNewDatabase)
         self.connect(self.actionSetActiveTable, QtCore.SIGNAL("clicked()"), self.setActiveTable)
         self.connect(self.actionTest, QtCore.SIGNAL("clicked()"), self.sql_to_df)
+        self.connect(self.toolImportBathy, QtCore.SIGNAL("clicked()"), self.loadBathy)
+        self.connect(self.toolImportCurrents, QtCore.SIGNAL("clicked()"), self.loadCurrentModel)
 
         #######Coordinate Info for Patch Selection#######
         #######Might not need these, will create separate object for each patch#######
@@ -95,12 +111,21 @@ class classiPy2_Form(QtGui.QMainWindow, classipy2_ui.Ui_MainWindow):
         self.patches = []
         self.patch_size = self.patchSpinBox.value()
 
+        #######Point storage for current model#######
+        self.currents = pd.DataFrame(columns=['x','y','v'])
+
         #######Database setup#######
-        self.glcm_dataframe = pd.DataFrame(columns=['type', 'subtype','correlation','dissimilarity','homogeneity','energy','contrast','ASM'])
+        self.glcm_dataframe = pd.DataFrame(columns=['type', 'subtype','correlation','dissimilarity','homogeneity','energy','contrast','ASM', 'entropy', 'rugosity'])
         self.db = None
         self.cursor = None
         self.activeDatabase = None
         self.activeTbl = None
+
+        #######Bathymetry Data#######
+        self.bathy = None
+        self.bathyCoords = None
+        self.bathyGridSize = None
+        self.bathyPixmap = None
 
         #######Variables#######
         self.rasterPixmaps = []
@@ -147,7 +172,7 @@ class classiPy2_Form(QtGui.QMainWindow, classipy2_ui.Ui_MainWindow):
         #for training, and patches from the active raster will be passed in as test data. Note that rather
         #than the user selecting individual unknown patches, that classification will occur over the
         #entire raster in blocks.
-        features = dataframe[['correlation','dissimilarity','homogeneity','energy','contrast','ASM']]
+        features = dataframe[['correlation','dissimilarity','homogeneity','energy','contrast','ASM','entropy', 'rugosity']]
 
         labels = dataframe['type']
 
@@ -166,13 +191,20 @@ class classiPy2_Form(QtGui.QMainWindow, classipy2_ui.Ui_MainWindow):
 
         self.rfAccuracy = metrics.accuracy_score(test_labels, rfPredict) * 100
 
-        self.cmdLine.updateLog("Random Forest Classification Accuracy: " + str(self.rfAccuracy))
-
         importances = list(rf.feature_importances_)
 
-        print(importances)
-        print(self.rfAccuracy)
-        print(rfPredict, test_labels)
+        self.cmdLine.updateLog("RF Classification Accuracy: " + str(self.rfAccuracy))
+
+        #tree_sample = rf.estimators_[5]
+        #export_graphviz(tree_sample, out_file = 'tree_sample.dot', feature_names = list(features.columns), rounded = True, precision =1)
+
+        #(graph,) = pydot.graph_from_dot_file('tree_sample.dot')
+
+        #graph.write_png('tree_sample.png')
+
+        #print(importances)
+        #print(self.rfAccuracy)
+        #print(rfPredict, test_labels)
 
     def glcmPropsToDb(self):
 
@@ -183,7 +215,9 @@ class classiPy2_Form(QtGui.QMainWindow, classipy2_ui.Ui_MainWindow):
         energy = []
         contrast = []
         asm = []
-        type = []
+        entropy = []
+        rugosity = []
+        Type = []
         subtype = []
 
         # Create GLCM (self.getGreyLevCoMatrix()), extract properties (greycoprops()), and append each property to its corresponding list.
@@ -195,10 +229,12 @@ class classiPy2_Form(QtGui.QMainWindow, classipy2_ui.Ui_MainWindow):
             energy.append(greycoprops(self.getGreyLevCoMatrix(p.get_patch()), 'energy')[0,0])
             contrast.append(greycoprops(self.getGreyLevCoMatrix(p.get_patch()), 'contrast')[0,0])
             asm.append(greycoprops(self.getGreyLevCoMatrix(p.get_patch()), 'ASM')[0,0])
-            type.append(str(p.get_type()))
+            Type.append(str(p.get_type()))
             subtype.append(str(p.get_subtype()))
+            entropy.append(str(p.get_entropy()))
+            rugosity.append(str(p.get_rugosity()))
 
-        self.glcm_dataframe['type'] = pd.Series(type)
+        self.glcm_dataframe['type'] = pd.Series(Type)
         self.glcm_dataframe['subtype'] = pd.Series(subtype)
         self.glcm_dataframe['correlation'] = pd.Series(correlation)
         self.glcm_dataframe['dissimilarity'] = pd.Series(dissimilarity)
@@ -206,6 +242,8 @@ class classiPy2_Form(QtGui.QMainWindow, classipy2_ui.Ui_MainWindow):
         self.glcm_dataframe['energy'] = pd.Series(energy)
         self.glcm_dataframe['contrast'] = pd.Series(contrast)
         self.glcm_dataframe['ASM'] = pd.Series(asm)
+        self.glcm_dataframe['entropy'] = pd.Series(entropy)
+        self.glcm_dataframe['rugosity'] = pd.Series(rugosity)
 
         self.currentDatabase.add_data(self.glcm_dataframe)
 
@@ -319,7 +357,7 @@ class classiPy2_Form(QtGui.QMainWindow, classipy2_ui.Ui_MainWindow):
 
             for i in range(len(dataframe['type'])):
                 
-                sql_insert = "INSERT INTO " + str(self.activeTbl) + " (type, subtype, correlation, dissimilarity, homogeneity, energy, contrast, asm) VALUES ('%s','%s',%s,%s,%s,%s,%s,%s)" % (dataframe.at[i,'type'],dataframe.at[i,'subtype'], dataframe.at[i, 'correlation'], dataframe.at[i, 'dissimilarity'], dataframe.at[i, 'homogeneity'], dataframe.at[i, 'energy'], dataframe.at[i, 'contrast'], dataframe.at[i, 'ASM'])
+                sql_insert = "INSERT INTO " + str(self.activeTbl) + " (type, subtype, correlation, dissimilarity, homogeneity, energy, contrast, asm, entropy, rugosity) VALUES ('%s','%s',%s,%s,%s,%s,%s,%s,%s,%s)" % (dataframe.at[i,'type'],dataframe.at[i,'subtype'], dataframe.at[i, 'correlation'], dataframe.at[i, 'dissimilarity'], dataframe.at[i, 'homogeneity'], dataframe.at[i, 'energy'], dataframe.at[i, 'contrast'], dataframe.at[i, 'ASM'], dataframe.at[i, 'entropy'], dataframe.at[i, 'rugosity'])
         
                 cursor.execute(sql_insert)
 
@@ -337,9 +375,9 @@ class classiPy2_Form(QtGui.QMainWindow, classipy2_ui.Ui_MainWindow):
 
     def sql_to_df(self):
 
-        cols = ['type','subtype','correlation','dissimilarity','homogeneity','energy','contrast','asm']
+        cols = ['type','subtype','correlation','dissimilarity','homogeneity','energy','contrast','asm', 'entropy', 'rugosity']
 
-        df = pd.DataFrame(columns=['type', 'subtype', 'correlation','dissimilarity','homogeneity','energy','contrast','asm'])
+        df = pd.DataFrame(columns=['type', 'subtype', 'correlation','dissimilarity','homogeneity','energy','contrast','asm', 'entropy', 'rugosity'])
 
         for name in cols:
 
@@ -428,6 +466,65 @@ class classiPy2_Form(QtGui.QMainWindow, classipy2_ui.Ui_MainWindow):
 
         return(filteredGeo)
 
+    def loadCurrentModel(self):
+
+        inputCurrentFile = str(QtGui.QFileDialog.getOpenFileName(self, 'Select current model file...', '', ".dat(*.dat)"))
+        inputCurrentLocFile = str(QtGui.QFileDialog.getOpenFileName(self, 'Select current model location file...', '', ".dat(*.dat)"))
+
+        crs_wgs = pyproj.Proj(init='epsg:4326')
+        crs_utm = pyproj.Proj(init='epsg:26909')
+
+        currents = pd.read_csv(inputCurrentFile, sep='\t', header=None)
+        currents.columns = ['velocity','depth','notImportant']
+        currents.drop(['depth', 'notImportant'], axis=1)
+
+        locations = pd.read_csv(inputCurrentLocFile, sep=' ', header=None)
+        locations.columns = ['lat', 'long']
+        #locations['velocity'] = currents['velocity']
+
+        lat = np.array(locations['lat'])
+        lon = np.array(locations['long'])
+
+        x, y = pyproj.transform(crs_wgs, crs_utm, lat, lon)
+
+        self.currents['x'] = x
+        self.currents['y'] = y
+        self.currents['v'] = currents['velocity']
+
+        self.cmdLine.updateLog("Ocean current model loaded successfully.")
+  
+    def loadBathy(self):
+
+        inputBathyFilePath = QtGui.QFileDialog.getOpenFileName(self, 'Select file to open...', '', ".tif(*.tif)")
+        rasterCoords = None
+        noData = 3.4028230607371e+38
+        
+        
+        rasterFile = gdal.Open(str(inputBathyFilePath))
+
+        rasterCoords = (rasterFile.GetGeoTransform()[0], rasterFile.GetGeoTransform()[3])
+
+        self.bathyGridSize = rasterFile.GetGeoTransform()[1]
+
+        rasterBand = rasterFile.GetRasterBand(1)
+
+        #arr = rasterBand.SetNoDataValue(noData)
+
+        arr = np.array(rasterBand.ReadAsArray())
+
+        arr = np.ma.masked_where(arr == abs(noData), arr)
+
+        self.bathy = arr
+        self.bathyCoords = rasterCoords
+
+        self.cmdLine.updateLog("Bathymetry loaded into memory. \n" + "Corner at XY: " + str(rasterCoords[0]) + 'm, ' + str(rasterCoords[1]) + 'm')
+
+        self.bathyPixmap = self.rasterToQPixMap(inputBathyFilePath)
+        
+        #val[0] will output the array
+        #val[1][0] will output the x coordinate of the top left corner
+        #val[1][1] will output the y coordinate of the top left corner
+
     def rasterToQPixMap(self, inputRasterFilePath):
 
         # extract the file name from the file path
@@ -492,7 +589,7 @@ class classiPy2_Form(QtGui.QMainWindow, classipy2_ui.Ui_MainWindow):
 
         self.treeItemNum += 1
 
-    def rasterToArray(self, inputRaster, scaleFactor = 1):
+    def rasterToArray(self, inputRaster, scaleFactor = 5):
 
         # Set nodata values to a more standard value
         noData = -3.4028230607371e+38
@@ -580,7 +677,7 @@ class currentDatabase(QtGui.QTableWidget):
 
         hHeader = self.horizontalHeader()
         hHeader.setResizeMode(QtGui.QHeaderView.ResizeToContents)
-        self.setHorizontalHeaderLabels(['Type','Subtype','Correlation','Dissimilarity','Homogeneity','Energy','Contrast','ASM'])
+        self.setHorizontalHeaderLabels(['Type','Subtype','Correlation','Dissimilarity','Homogeneity','Energy','Contrast','ASM', 'Entropy', 'Rugosity'])
 
     def add_data(self, dataframe):
 
@@ -610,7 +707,7 @@ class sqlDatabase(QtGui.QTableWidget):
 
         hHeader = self.horizontalHeader()
         hHeader.setResizeMode(QtGui.QHeaderView.ResizeToContents)
-        self.setHorizontalHeaderLabels(['Type','Subtype','Correlation','Dissimilarity','Homogeneity','Energy','Contrast','ASM'])
+        self.setHorizontalHeaderLabels(['Type','Subtype','Correlation','Dissimilarity','Homogeneity','Energy','Contrast','ASM', 'Entropy', 'Rugosity'])
 
 class rasterPropertyTable(QtGui.QTableWidget):
 
@@ -774,13 +871,15 @@ class canvas(QtGui.QGraphicsView):
 
         self.patchsize = None
 
-        self.type = None
+        self.Type = None
 
         self.graphicsItems = []
 
+        self.points = []
+
         self.patches = []
 
-        self.patch_dataframe = pd.DataFrame(columns=['correlation','dissimilarity','homogeneity','energy','contrast','asm'])
+        self.patch_dataframe = pd.DataFrame(columns=['correlation','dissimilarity','homogeneity','energy','contrast','asm', 'entropy'])
 
     def get_parent(self):
 
@@ -802,11 +901,19 @@ class canvas(QtGui.QGraphicsView):
 
         return(greycomatrix(patch, [5], [0], 256, symmetric = True, normed = True))
 
+    # Might somehow incorperate edge detection in order to deliniate the raster
+    # into separate texture areas before beginning classification
+    def getEdges(self, patch):
+
+        return(canny(patch, sigma=3))
+
     # Core algorithm for the classification of a backscatter raster image.
     def moving_patch(self):
+
+        self.get_parent().cmdLine.updateLog("Beginning classification. This may take a while...")
         
         arr = self.get_parent().rasterArray[self.getIndex() - 1]
-        size = int(self.get_parent().patch_size)
+        size = int(self.get_parent().patchSpinBox.value())
         shp = arr.shape
 
         cornerX = self.getCorners()[0]
@@ -818,6 +925,12 @@ class canvas(QtGui.QGraphicsView):
         energy = None
         contrast = None
         asm = None
+        entropy = None
+        rugosity = None
+
+        colorVeg = QtGui.QColor(204, 255, 204, 100)
+        colorSed = QtGui.QColor(252, 199, 16, 100)
+        colorRoc = QtGui.QColor(164, 0, 4, 100)
 
         #Load in the sql database. We will need this for RF classification
         trained_set = self.get_parent().sql_to_df()
@@ -825,12 +938,12 @@ class canvas(QtGui.QGraphicsView):
         # Set up train and test labels/features       
         train_labels = pd.Series(trained_set['type'], dtype='category').cat.codes.values
 
-        print(train_labels)
+        #print(train_labels)
         
         train_labels = np.array(train_labels)
         
         train_features = trained_set.drop('type', axis=1)
-        
+        train_features = train_features.drop('correlation', axis=1)
         train_features = train_features.drop('subtype', axis=1)
         
         feature_list = list(train_features.columns)
@@ -840,7 +953,7 @@ class canvas(QtGui.QGraphicsView):
         test_label = [0]
 
         # Build the random forest classifier
-        rf = RandomForestClassifier(n_estimators = 300, n_jobs=-1)
+        rf = RandomForestClassifier(n_estimators = 200, n_jobs = 2)
 
         # Train the classifier
         rf.fit(train_features, train_labels)
@@ -857,51 +970,62 @@ class canvas(QtGui.QGraphicsView):
 
         for x in range(0, int(shp[1] - size), size):
 
-            print('Classifying column ' + str(x) + ' of ' + str(shp[1]))
+            #self.get_parent().cmdLine.updateLog('Classifying column ' + str(x) + ' of ' + str(shp[1]))
 
             for y in range(0, int(shp[0] - size), size):
                 
-                newPatch = patch(cornerX + x,cornerY + y, size, 'unknown', 'unknown', self.getIndex(), self.getCorners()[0], self.getCorners()[1], self.get_parent().rasterArray[self.getIndex() - 1])
+                newPatch = patch(self.get_parent(), cornerX + x,cornerY + y, size, 'unknown', 'unknown', self.getIndex(), self.getCorners()[0],
+                                 self.getCorners()[1], self.get_parent().rasterArray[self.getIndex() - 1])
 
-                newPatch = newPatch.get_patch()
+                newPatchArray = newPatch.get_patch()
+
+                glcm = self.getGreyLevCoMatrix(newPatchArray)
 
                 if newPatch.size != 0:
                 
-                    correlation = greycoprops(self.getGreyLevCoMatrix(newPatch), 'correlation')[0,0]
-                    dissimilarity = greycoprops(self.getGreyLevCoMatrix(newPatch), 'dissimilarity')[0,0]
-                    homogeneity = greycoprops(self.getGreyLevCoMatrix(newPatch), 'homogeneity')[0,0]
-                    contrast = greycoprops(self.getGreyLevCoMatrix(newPatch), 'contrast')[0,0]
-                    energy = greycoprops(self.getGreyLevCoMatrix(newPatch), 'energy')[0,0]
-                    asm = greycoprops(self.getGreyLevCoMatrix(newPatch), 'ASM')[0,0]
+                    correlation = greycoprops(glcm, 'correlation')[0,0]
+                    dissimilarity = greycoprops(glcm, 'dissimilarity')[0,0]
+                    homogeneity = greycoprops(glcm, 'homogeneity')[0,0]
+                    contrast = greycoprops(glcm, 'contrast')[0,0]
+                    energy = greycoprops(glcm, 'energy')[0,0]
+                    asm = greycoprops(glcm, 'ASM')[0,0]
+                    entropy = newPatch.get_entropy()
+                    rugosity = newPatch.get_rugosity()
 
-                    if correlation == 1 and homogeneity == 1 and homogeneity == 1:
+                    if rugosity > 10:
 
                         pass
 
                     else:
 
-                        # This is the feature to be classified
-                        test_features = [[correlation, dissimilarity, homogeneity, contrast, energy, asm]]
-                        
-                        rfPredict = rf.predict(test_features)
-                
-                        rectItem = QtGui.QGraphicsRectItem(0,0, size, size)
+                        if correlation == 1 and homogeneity == 1 and homogeneity == 1:
 
-                        if rfPredict[0] == 2:
-
-                            rectItem.setBrush(QtGui.QBrush(QtCore.Qt.green, style = QtCore.Qt.Dense4Pattern))
-
-                        elif rfPredict[0] == 1:
-
-                            rectItem.setBrush(QtGui.QBrush(QtCore.Qt.yellow, style = QtCore.Qt.Dense4Pattern))
+                            pass
 
                         else:
 
-                            rectItem.setBrush(QtGui.QBrush(QtCore.Qt.darkRed, style = QtCore.Qt.Dense4Pattern))
-
-                        rectItem.setPos(cornerX + x, cornerY + y)
+                            # This is the feature to be classified
+                            test_features = [[dissimilarity, homogeneity, contrast, energy, asm, entropy, rugosity]] # Just removed correlation from the list
                         
-                        self.scene().addItem(rectItem)
+                            rfPredict = rf.predict(test_features)
+                
+                            rectItem = QtGui.QGraphicsRectItem(0,0, size, size)
+
+                            if rfPredict[0] == 2:
+
+                                rectItem.setBrush(QtGui.QBrush(colorVeg))
+
+                            elif rfPredict[0] == 1:
+
+                                rectItem.setBrush(QtGui.QBrush(colorSed))
+
+                            else:
+
+                                rectItem.setBrush(QtGui.QBrush(colorRoc))
+
+                            rectItem.setPos(cornerX + x, cornerY + y)
+                        
+                            self.scene().addItem(rectItem)
 
         self.get_parent().glcmPropsToDb()
 
@@ -932,6 +1056,15 @@ class canvas(QtGui.QGraphicsView):
         self.get_parent().yLabel.setText(str(coords.y()))
 
         super(canvas, self).mouseMoveEvent(event)
+
+    def drawPoint(self, x, y):
+        #self.points = []
+        
+        pointItem = QtGui.QGraphicsTextItem()
+        pointItem.setText('+')
+        pointItem.setPos(x, y)
+        self.points.append(pointItem)
+        self.scene().addItem(self.points[-1])
         
     def mousePressEvent(self, event):
 
@@ -957,7 +1090,7 @@ class canvas(QtGui.QGraphicsView):
             self.scene().addItem(self.graphicsItems[-1])
 
             # Retrieve the current seabed type being identified
-            self.type = self.get_parent().typeBox.currentText()
+            self.Type = self.get_parent().typeBox.currentText()
             self.subtype = self.get_parent().subtypeBox.currentText()
 
             #Debug some stuff
@@ -968,14 +1101,20 @@ class canvas(QtGui.QGraphicsView):
             #print(type(self.get_parent().rasterArray[self.getIndex() - 1]))
 
             # Create new patch variable based on user selected coordinates
-            newPatch = patch(coords.x() - self.rectItem.boundingRect().width() / 2.0,
-                             coords.y() - self.rectItem.boundingRect().height() / 2.0, self.patchsize, self.type, self.subtype,
-                             self.getIndex(), self.getCorners()[0], self.getCorners()[1], self.get_parent().rasterArray[self.getIndex() - 1])
+            newPatch = patch(self.get_parent(), coords.x() - self.rectItem.boundingRect().width() / 2.0,
+                             coords.y() - self.rectItem.boundingRect().height() / 2.0, self.patchsize, self.Type, self.subtype,
+                             self.getIndex(), self.getCorners()[0], self.getCorners()[1],
+                             self.get_parent().rasterArray[self.getIndex() - 1])
 
             # Append a new patch object to the class patch variable
             self.patches.append(newPatch)
 
+            #print(np.var(newPatch.get_rugosity()))
+            #area = newPatch.get_surface_area(newPatch.bathyPatch)
+            #planarArea = newPatch.get_surface_area(newPatch.best_fit_plane(newPatch.bathyPatch))
+
             i = newPatch.get_pixmap()
+            
             self.get_parent().drawPreview(i)
             
         super(canvas, self).mousePressEvent(event)
@@ -1027,7 +1166,7 @@ class canvas(QtGui.QGraphicsView):
 
 class patch(object):
 
-    def __init__(self, x, y, size, type, subtype, index, cornerX, cornerY, rasterArray):
+    def __init__(self, parentClass, x, y, size, Type, subtype, index, cornerX, cornerY, rasterArray):
 
         #Note that the patches coordinates will be that of the scene.
         #Need to convert to local image coordinates for array manipulation.
@@ -1043,12 +1182,17 @@ class patch(object):
         self.cornerY = cornerY
         
         self.size = size
-        self.type = type
+        self.Type = Type
         self.subtype = subtype
 
+        self.patch = None
+        self.bathyPatch = None
+
+        self.parentClass = parentClass
 
         #self.image = self.parent().parent().parent().rasterArray[self.index]
 
+    # Convert the active patch to a pixmap for display on the GUI
     def get_pixmap(self):
 
         patch = self.get_patch()
@@ -1060,6 +1204,153 @@ class patch(object):
         qPixMap = QtGui.QPixmap.fromImage(arr_Image)
 
         return(qPixMap)
+    
+    # Retieve bathymetry values which correspond with the current patch
+    def get_patch_bathy(self):
+
+        # The coordinates for the northwestern corner of the bathymetry raster
+        bathyX = self.parentClass.bathyCoords[0]
+        bathyY = self.parentClass.bathyCoords[1]
+
+        # Get offset coordinates so that the bathy matches the backscatter
+        offsetX = bathyX - self.cornerX
+        offsetY = bathyY - self.cornerY
+
+        # Need to get local coordinates of the patch and offset them by the values above
+        x = self.get_local_coords()[0] + offsetX
+        y = self.get_local_coords()[1] + offsetY
+
+        # Create a patch of bathymetry data which corresponds to the backscatter data.
+        patch_bathy = self.parentClass.bathy[int(y): int(y) + int(self.size), int(x): int(x) + int(self.size)]
+        self.bathyPatch = patch_bathy
+        
+        return(patch_bathy, x, y)
+
+    # returns the length of a 3D vector
+    def get_vector_length(self, vector):
+
+        return(((vector[0] ** 2) + (vector[1] ** 2) + (vector[2] ** 2) ** 0.5))
+
+    # returns the dot product of a 3d vector
+    def dot_product_3d(self, u, v):
+
+        return(u[0] * v[0] + u[1] * v[1] + u[2] * v[2])
+        
+    # Get angle between a set of 2 3D vectors
+    def get_vector_props(self, u, v):
+
+        dotVectors = self.dot_product_3d(u, v)
+        lengthU = self.get_vector_length(u)
+        lengthV = self.get_vector_length(v)
+
+        angle = degrees(acos(dotVectors / (lengthU * lengthV)))
+
+        return(angle, lengthU, lengthV)
+                   
+    def get_surface_area(self, inputArr):
+
+        #arr = self.bathyPatch
+
+        total_area = 0
+
+        skip_count = 0
+
+        gridSize = self.parentClass.bathyGridSize
+
+        arr = inputArr.astype(float)
+
+        for x in range(0, arr.shape[1] - 1, 2):
+
+            for y in range(0, arr.shape[0] - 1, 2):
+
+                currentBlock = arr[int(y): int(y) + 2, int(x): int(x) + 2]
+
+                # Get the angles and sides from the vectors which make up the active block.
+                v1 = self.get_vector_props((0,gridSize,currentBlock[0][1] - currentBlock[0][0]),(gridSize, 0, currentBlock[1][0] - currentBlock[0][0]))
+                v2 = self.get_vector_props((0,gridSize,currentBlock[0][0] - currentBlock[0][1]),(gridSize, 0, currentBlock[1][1] - currentBlock[0][1]))
+                v3 = self.get_vector_props((gridSize,0,currentBlock[0][1] - currentBlock[1][1]),(0, gridSize, currentBlock[1][0] - currentBlock[1][1]))
+                v4 = self.get_vector_props((gridSize,0,currentBlock[0][0] - currentBlock[1][0]),(0, gridSize, currentBlock[0][0] - currentBlock[1][0]))
+
+                # Yeah, I know storing the lengths with the angles in a tuple would end up being slightly confusing, but alas, earwax.
+                # Also, I capitolized the L's because otherwise they look like the number 1.
+                L1 = v1[1]
+                L2 = v2[2]
+                L3 = v3[2]
+                L4 = v4[1]
+
+                # a1 and a3 are opposite angles
+                # angle a1 connects sides L1 and L4
+                # angle a2 connects sides L1 and L2
+                # angle a3 connects sides L2 and L3
+                # andle a4 connects sides L4 and L3
+                a1 = v1[0]
+                a2 = v2[0]
+                a3 = v3[0]
+                a4 = v4[0]
+
+                # Calculate the area of the quadrilateral formed by the four vectors.                    
+                area = (0.5 * (L1 * L4) * sin(radians(a1))) + (0.5 * (L2 * L3) * sin(radians(a3)))
+
+                if area < 100000 and area > -100000:
+
+                    total_area += area
+
+                else:
+
+                    skip_count += 1
+                    
+                #print(str(area) + ' = ' + str(0.5) + ' * (' + str(L1) + ' * ' + str(L4) + ') * ' + str(sin(radians(a1))) + ' + (0.5 * (' + str(L2) + ' * ' + str(L3) + ') * ' + str(sin(radians(a3))))
+
+        #print("Skipped " + str(skip_count) + " due to missing data points.")
+        #print("Total Area: " + str(total_area))
+        #print("Planar Area: " + str(planar_area))
+        #print("Area Ratio: " + str(area / planar_area))
+        
+        return(total_area)
+
+    # interpolate between two values
+    def interpolate(self, val1, val2, steps):
+
+        interp = []
+
+        slope = (val2 - val1) / steps
+
+        i = val1
+        
+        for x in range(int(steps) + 1):
+
+            i += slope
+
+            interp.append(i)
+
+        return(interp)
+
+    # Returns a plane which matches the patch at all four corners.
+    def best_fit_plane(self, arr):
+
+        arr = arr.astype(float)
+
+        # Select the first column of the array. Interpolate from the first value to the final value.
+        arr[0:,0] = self.interpolate(float(arr[0:,0][0]), float(arr[0:,0][-1]), len(arr[0:,0]) - 1)
+        
+        arr[1:,0] = self.interpolate(float(arr[1:,0][0]), float(arr[1:,0][-1]), len(arr[1:,0]) - 1)
+        
+        # for x in the range of the length of the first row, interpolate each row from left to right.
+        for x in range(len(arr[0])):
+
+            arr[x] = self.interpolate(float(arr[x][0]), float(arr[x][-1]), len(arr[x]) - 1)
+
+        return(arr)
+
+    def get_rugosity(self):
+
+        patch = self.get_patch_bathy()[0]
+        
+        area = self.get_surface_area(patch)
+        
+        planar = self.get_surface_area(self.best_fit_plane(patch))
+
+        return(area / planar)
 
     def get_Active_Raster_Index(self):
 
@@ -1079,7 +1370,7 @@ class patch(object):
 
     def get_type(self):
 
-        return(self.type)
+        return(self.Type)
 
     def get_patch(self):
 
@@ -1105,6 +1396,16 @@ class patch(object):
         y = self.y - self.cornerY
 
         return((x, y))
+
+    def get_entropy(self):
+
+        i = np.squeeze(self.get_glcm())
+
+        return(-np.sum(i * np.log2(i + (i == 0))))
+
+    def get_glcm(self):
+
+        return(greycomatrix(self.get_patch(), [5], [0], 256, symmetric = True, normed = True))
 
 app = QtGui.QApplication(sys.argv)
 
