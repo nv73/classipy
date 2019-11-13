@@ -919,6 +919,7 @@ class canvas(QtGui.QGraphicsView):
         cornerX = self.getCorners()[0]
         cornerY = self.getCorners()[1]
 
+
         correlation = None
         dissimilarity = None
         homogeneity = None
@@ -1223,7 +1224,8 @@ class patch(object):
         # Create a patch of bathymetry data which corresponds to the backscatter data.
         patch_bathy = self.parentClass.bathy[int(y): int(y) + int(self.size), int(x): int(x) + int(self.size)]
         self.bathyPatch = patch_bathy
-        
+        print("Patch Bathy: ")
+        print(patch_bathy)
         return(patch_bathy, x, y)
 
     # returns the length of a 3D vector
@@ -1272,7 +1274,7 @@ class patch(object):
                 v4 = self.get_vector_props((gridSize,0,currentBlock[0][0] - currentBlock[1][0]),(0, gridSize, currentBlock[0][0] - currentBlock[1][0]))
 
                 # Yeah, I know storing the lengths with the angles in a tuple would end up being slightly confusing, but alas, earwax.
-                # Also, I capitolized the L's because otherwise they look like the number 1.
+                # Also, I capitalized the L's because otherwise they look like the number 1.
                 L1 = v1[1]
                 L2 = v2[2]
                 L3 = v3[2]
@@ -1329,6 +1331,8 @@ class patch(object):
     def best_fit_plane(self, arr):
 
         arr = arr.astype(float)
+        print("best_fit_plane: ")
+        print(arr)
 
         # Select the first column of the array. Interpolate from the first value to the final value.
         arr[0:,0] = self.interpolate(float(arr[0:,0][0]), float(arr[0:,0][-1]), len(arr[0:,0]) - 1)
@@ -1345,6 +1349,8 @@ class patch(object):
     def get_rugosity(self):
 
         patch = self.get_patch_bathy()[0]
+        print("get_rugosity: ")
+        print(patch)
         
         area = self.get_surface_area(patch)
         
@@ -1372,6 +1378,7 @@ class patch(object):
 
         return(self.Type)
 
+    #The most important lines of code.
     def get_patch(self):
 
         x = self.get_local_coords()[0]
